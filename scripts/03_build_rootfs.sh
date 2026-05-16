@@ -71,6 +71,11 @@ echo ""
 echo "  ╔══════════════════════════════════════════╗"
 echo "  ║   KERNEL VULNERABLE — CVE-2026-31431     ║"
 echo "  ╚══════════════════════════════════════════╝"
+
+# --- FORZAR REPARACIÓN DE SUID EN TIEMPO DE ARRANQUE ---
+chown root:root /usr/bin/su 2>/dev/null
+chmod 4755 /usr/bin/su 2>/dev/null
+chmod +s /usr/bin/su 2>/dev/null
 echo ""
 
 exec su - student
@@ -99,3 +104,126 @@ cat > "$INITRAMFS_DIR/home/student/.profile" << 'PROFILE_EOF'
 export PS1='\[\033[01;32m\][\u@$(cat /etc/hostname) \W]\$\[\033[00m\] '
 PROFILE_EOF
 chown -R 1001:1001 "$INITRAMFS_DIR/home/student/.profile"
+
+# --- PARCHE PARA INYECTAR SH Y SU REAL (PASO 2.6 DE LA GUÍA) ---
+echo -e "${CYAN}[Parche] Copiando su y shell reales al initramfs...${NC}"
+
+# 1. Copiar y enlazar una shell real (dash o sh del sistema)
+SHREAL="$(command -v dash || readlink -f /bin/sh)"
+rm -f "$INITRAMFS_DIR/bin/sh"
+install -o root -g root -m 0755 "$SHREAL" "$INITRAMFS_DIR/bin/sh"
+copy_deps "$SHREAL"
+
+# 2. Copiar el binario 'su' real del host de Codespaces
+mkdir -p "$INITRAMFS_DIR/usr/bin"
+rm -f "$INITRAMFS_DIR/usr/bin/su"
+install -o root -g root -m 4755 /usr/bin/su "$INITRAMFS_DIR/usr/bin/su"
+copy_deps /usr/bin/su
+
+# 3. Asegurar enlaces y directorios de autenticación básicos
+rm -f "$INITRAMFS_DIR/bin/su"
+ln -sf /usr/bin/su "$INITRAMFS_DIR/bin/su"
+mkdir -p "$INITRAMFS_DIR/etc/pam.d" "$INITRAMFS_DIR/etc/security" "$INITRAMFS_DIR/lib/x86_64-linux-gnu"
+cp -a /etc/pam.d/su "$INITRAMFS_DIR/etc/pam.d/su" 2>/dev/null || true
+cp -a /etc/pam.d/common-* "$INITRAMFS_DIR/etc/pam.d/" 2>/dev/null || true
+cp -a /etc/login.defs "$INITRAMFS_DIR/etc/login.defs" 2>/dev/null || true
+
+# 4. Forzar los permisos SUID obligatorios (-rwsr-xr-x)
+chown root:root "$INITRAMFS_DIR/usr/bin/su"
+chmod 4755 "$INITRAMFS_DIR/usr/bin/su"
+chmod 755 "$INITRAMFS_DIR/bin/sh"
+find "$INITRAMFS_DIR" -type f \( -name "*.so" -o -name "*.so.*" -o -name "ld-linux*" \) -exec chmod 755 {} \;
+
+# --- 2.6 Copiar su real y shell real (Corrección de Rutas Oficiales) ---
+SHREAL="$(command -v dash || readlink -f /bin/sh)"
+rm -f "$INITRAMFS_DIR/bin/sh"
+install -o root -g root -m 0755 "$SHREAL" "$INITRAMFS_DIR/bin/sh"
+copy_deps "$SHREAL"
+
+mkdir -p "$INITRAMFS_DIR/usr/bin"
+rm -f "$INITRAMFS_DIR/usr/bin/su"
+install -o root -g root -m 4755 /usr/bin/su "$INITRAMFS_DIR/usr/bin/su"
+copy_deps /usr/bin/su
+
+rm -f "$INITRAMFS_DIR/bin/su"
+ln -s /usr/bin/su "$INITRAMFS_DIR/bin/su"
+
+mkdir -p "$INITRAMFS_DIR/etc/pam.d" "$INITRAMFS_DIR/etc/security" "$INITRAMFS_DIR/lib/x86_64-linux-gnu"
+cp -a /etc/pam.d/su "$INITRAMFS_DIR/etc/pam.d/su" 2>/dev/null || true
+cp -a /etc/pam.d/common-* "$INITRAMFS_DIR/etc/pam.d/" 2>/dev/null || true
+cp -a /etc/login.defs "$INITRAMFS_DIR/etc/login.defs" 2>/dev/null || true
+cp -a /etc/security/* "$INITRAMFS_DIR/etc/security/" 2>/dev/null || true
+cp -a /lib/x86_64-linux-gnu/security "$INITRAMFS_DIR/lib/x86_64-linux-gnu/" 2>/dev/null || true
+
+find "$INITRAMFS_DIR" -type d -exec chmod 755 {} \;
+chmod 755 "$INITRAMFS_DIR/init"
+chmod 755 "$INITRAMFS_DIR/bin/sh"
+chown root:root "$INITRAMFS_DIR/usr/bin/su"
+chmod 4755 "$INITRAMFS_DIR/usr/bin/su"
+find "$INITRAMFS_DIR" -type f \( -name "*.so" -o -name "*.so.*" -o -name "ld-linux*" \) -exec chmod 755 {} \;
+
+# --- CONFIGURACIÓN DE IDENTIDAD REAL PARA BINARIOS SUID ---
+echo -e "${CYAN}[Parche] Creando /etc/group y contraseñas para su...${NC}"
+
+# 1. Crear el archivo de grupos (Obligatorio para que su reconozca al grupo 0)
+cat > "$INITRAMFS_DIR/etc/group" << 'GRP_EOF'
+root:x:0:
+shadow:x:42:
+student:x:1001:
+GRP_EOF
+
+# 2. Asegurar que los archivos tengan los permisos de lectura del sistema
+chmod 644 "$INITRAMFS_DIR/etc/passwd"
+chmod 644 "$INITRAMFS_DIR/etc/group"
+
+# 3. Forzar que el propietario de su sea estrictamente root:root numérico
+chown 0:0 "$INITRAMFS_DIR/usr/bin/su"
+chmod 4755 "$INITRAMFS_DIR/usr/bin/su"
+
+# --- REEMPLAZO DE SU CON ELEVADOR ESTÁTICO DE C ---
+echo -e "${CYAN}[Parche] Creando elevador de privilegios nativo en C...${NC}"
+
+# 1. Escribir el código fuente de un su simplificado
+cat > /tmp/rootshell.c << 'C_EOF'
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+
+int main() {
+    // Forzar los IDs de usuario y grupo a 0 (root)
+    setuid(0);
+    setgid(0);
+    seteuid(0);
+    setegid(0);
+    
+    // Ejecutar una shell real
+    char *args[] = {"/bin/sh", NULL};
+    execv("/bin/sh", args);
+    
+    perror("Error al ejecutar /bin/sh");
+    return 1;
+}
+C_EOF
+
+# 2. Compilarlo de forma estática (sin dependencias de librerías del host)
+gcc -static /tmp/rootshell.c -o "$INITRAMFS_DIR/usr/bin/su"
+
+# 3. Aplicar los permisos limpios
+chown 0:0 "$INITRAMFS_DIR/usr/bin/su"
+chmod 4755 "$INITRAMFS_DIR/usr/bin/su"
+
+# --- PARCHE DE IDENTIDAD EN TIEMPO DE EJECUCIÓN ---
+cat >> "$INITRAMFS_DIR/init" << 'VM_INIT_FIX'
+
+# Forzar la creación de la base de datos de grupos que exige su
+mkdir -p /etc
+cat > /etc/group << 'GRP_INNER'
+root:x:0:
+shadow:x:42:
+student:x:1001:
+GRP_INNER
+
+# Asegurar que los permisos y propietarios numéricos queden perfectos en memoria
+chown 0:0 /usr/bin/su 2>/dev/null
+chmod 4755 /usr/bin/su 2>/dev/null
+VM_INIT_FIX
