@@ -33,60 +33,34 @@ make CONFIG_PREFIX="$INITRAMFS_DIR" install
 # Estructura de directorios de un sistema Linux/UNIX real
 mkdir -p "$INITRAMFS_DIR"/{proc,sys,dev,tmp,etc,root,home/student,usr/bin,usr/lib,lib,lib64,run}
 
-# ── [CRÍTICO] SOLUCIÓN AL KERNEL PANIC: LIBS Y ENLAZADOR ─────────────────────
-echo -e "${CYAN}[5/6] Copiando Python y solucionando dependencias de librerías...${NC}"
-PYTHON_BIN=$(which python3)
-cp "$PYTHON_BIN" "$INITRAMFS_DIR/usr/bin/python3"
+echo -e "${CYAN}[5/6] Copiando Python y solucionando dependencias (Método de la Guía)...${NC}"
+
+# Función de tu documento para rastrear y copiar librerías dinámicas obligatorias
+copy_deps() {
+  local bin="$1"
+  ldd "$bin" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^\//) print $i}' | while read -r lib; do
+    mkdir -p "$INITRAMFS_DIR$(dirname "$lib")"
+    cp -L "$lib" "$INITRAMFS_DIR$lib"
+    chmod 755 "$INITRAMFS_DIR$lib"
+  done
+}
+
+# Configurar e instalar el ejecutable de Python3
+mkdir -p "$INITRAMFS_DIR/usr/bin"
+PYBIN="$(command -v python3)"
+install -o root -g root -m 0755 "$PYBIN" "$INITRAMFS_DIR/usr/bin/python3"
 ln -sf python3 "$INITRAMFS_DIR/usr/bin/python"
 
-# Copiar el enlazador dinámico (evita el Error -2 ENOENT)
-cp -L /lib64/ld-linux-x86-64.so.2 "$INITRAMFS_DIR/lib64/" 2>/dev/null || true
-cp -L /lib/ld-linux-x86-64.so.2 "$INITRAMFS_DIR/lib/" 2>/dev/null || true
+# Ejecutar el rastreador de librerías sobre Python
+copy_deps "$PYBIN"
 
-# Rastrear y copiar librerías compartidas de Python usando ldd
-for lib in $(ldd "$PYTHON_BIN" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
-  mkdir -p "$INITRAMFS_DIR$(dirname "$lib")"
-  cp -L "$lib" "$INITRAMFS_DIR$lib" 2>/dev/null || true
-done
-
-# Copiar la librería estándar mínima de Python
-PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-mkdir -p "$INITRAMFS_DIR/usr/lib/python${PYTHON_VER}"
-cp -r /usr/lib/python3/* "$INITRAMFS_DIR/usr/lib/python${PYTHON_VER}/" 2>/dev/null || true
-# ────────────────────────────────────────────────────────────────────────────────
+# Copiar la librería estándar de Python
+PYVER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
+mkdir -p "$INITRAMFS_DIR/usr/lib"
+cp -a "/usr/lib/$PYVER" "$INITRAMFS_DIR/usr/lib/" 2>/dev/null || true
+cp -a /usr/local/lib/python* "$INITRAMFS_DIR/usr/local/lib/" 2>/dev/null || true
 
 # Configuración básica de usuarios
 cat > "$INITRAMFS_DIR/etc/passwd" << 'EOF'
 root:x:0:0:root:/root:/bin/sh
 student:x:1001:1001:student:/home/student:/bin/sh
-EOF
-
-# Crear el script de arranque /init
-cat > "$INITRAMFS_DIR/init" << 'INITEOF'
-#!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev 2>/dev/null || mdev -s
-mount -t tmpfs none /tmp
-
-# Módulos para el reto copy-fail (CVE-2026-31431)
-modprobe algif_aead 2>/dev/null || true
-modprobe authencesn 2>/dev/null || true
-
-echo ""
-echo "  ╔══════════════════════════════════════════╗"
-echo "  ║   KERNEL VULNERABLE — CVE-2026-31431     ║"
-echo "  ╚══════════════════════════════════════════╝"
-echo ""
-
-# Forzar el inicio seguro degradando privilegios a student
-exec su - student
-INITEOF
-
-chmod +x "$INITRAMFS_DIR/init"
-
-echo -e "${CYAN}[6/6] Empaquetando initramfs con cpio...${NC}"
-cd "$INITRAMFS_DIR"
-find . | cpio -o -H newc 2>/dev/null | gzip > "$BUILD_DIR/initramfs.cpio.gz"
-
-echo -e "${GREEN}✓ rootfs listo y parchado sin Kernel Panic!${NC}"

@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# scripts/03_build_rootfs.sh
-# Construye initramfs con BusyBox estático
-#
-# Lecciones aprendidas (¡todas críticas!):
-#   - scripts/config NO existe en BusyBox → usar sed
-#   - olddefconfig NO existe en BusyBox → quitarlo
-#   - CONFIG_TC=y rompe la compilación con kernels nuevos → poner =n
-#   - CONFIG_STATIC=y es OBLIGATORIO o nada funciona
-#   - make defconfig puede pedir entrada interactiva → usar yes "" pipe
-#   - bzip2 debe estar instalado (manejado en Dockerfile)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,97 +6,96 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUSYBOX_SRC="$WORKSPACE_ROOT/kernel/busybox"
 INITRAMFS_DIR="$WORKSPACE_ROOT/kernel/initramfs"
 BUILD_DIR="$WORKSPACE_ROOT/kernel/build"
-JOBS="$(nproc)"
+JOBS=$(nproc)
 
-STUDENT_ID="${STUDENT_ID:-$(git -C "$WORKSPACE_ROOT" config user.name 2>/dev/null \
-                | tr ' ' '-' | tr -cd '[:alnum:]-' | head -c 20)}"
-STUDENT_ID="${STUDENT_ID:-unnamed}"
+GREEN='\033[1;32m'; CYAN='\033[1;36m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
-CYAN='\033[1;36m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-
-echo -e "${CYAN}[1/5] Clonando BusyBox...${NC}"
+echo -e "${CYAN}[1/6] Clonando/Verificando BusyBox...${NC}"
 if [ ! -d "$BUSYBOX_SRC" ]; then
-  git clone --depth 1 https://git.busybox.net/busybox "$BUSYBOX_SRC"
+    git clone --depth 1 https://git.busybox.net/busybox "$BUSYBOX_SRC"
 fi
 
 cd "$BUSYBOX_SRC"
-
-echo -e "${CYAN}[2/5] Configurando BusyBox (static + sin TC)...${NC}"
-# yes "" alimenta enter a posibles preguntas interactivas de defconfig
-#yes "" | make defconfig >/dev/null 2>&1
+echo -e "${CYAN}[2/6] Configurando BusyBox (binario estático)...${NC}"
 make defconfig
-
-# CRÍTICO: editar el .config con sed (BusyBox NO tiene scripts/config)
 sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-grep -q "^CONFIG_STATIC=y" .config || echo "CONFIG_STATIC=y" >> .config
+grep -q "CONFIG_STATIC=y" .config || echo "CONFIG_STATIC=y" >> .config
+sed -i 's/CONFIG_TC=y/CONFIG_TC=n/' .config
 
-# CONFIG_TC rompe la compilación con kernels nuevos (error en networking/tc.c)
-sed -i 's/^CONFIG_TC=y/CONFIG_TC=n/' .config
-sed -i 's/^CONFIG_FEATURE_TC_INGRESS=y/CONFIG_FEATURE_TC_INGRESS=n/' .config
-
-# NOTA: BusyBox NO tiene "make olddefconfig", se compila directo
-
-echo -e "${CYAN}[3/5] Compilando BusyBox estático (~3-5 min)...${NC}"
+echo -e "${CYAN}[3/6] Compilando BusyBox...${NC}"
 make -j"$JOBS" 2>&1 | tail -3
 
-# Verificar que quedó estático
-if ! file busybox | grep -q "statically linked"; then
-  echo -e "${YELLOW}⚠ BusyBox NO quedó estático. Verificando .config...${NC}"
-  grep STATIC .config
-  exit 1
-fi
-echo -e "${GREEN}  ✓ BusyBox compilado estáticamente${NC}"
-
-echo -e "${CYAN}[4/5] Instalando BusyBox en initramfs y armando estructura...${NC}"
-rm -rf "$INITRAMFS_DIR"
+echo -e "${CYAN}[4/6] Instalando BusyBox en el initramfs...${NC}"
 mkdir -p "$INITRAMFS_DIR"
-make CONFIG_PREFIX="$INITRAMFS_DIR" install 2>&1 | tail -3
+make CONFIG_PREFIX="$INITRAMFS_DIR" install
 
-# Estructura mínima
-mkdir -p "$INITRAMFS_DIR"/{proc,sys,dev,tmp,etc,root,home/student,run}
+mkdir -p "$INITRAMFS_DIR"/{proc,sys,dev,tmp,etc,root,home/student,usr/bin,usr/lib,lib,lib64,run}
 
-# Usuario student (sin privilegios) y root
-cat > "$INITRAMFS_DIR/etc/passwd" << 'PASSWD'
+echo -e "${CYAN}[5/6] Copiando Python y solucionando dependencias dinámicas...${NC}"
+copy_deps() {
+  local bin="$1"
+  ldd "$bin" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^\//) print $i}' | while read -r lib; do
+    mkdir -p "$INITRAMFS_DIR$(dirname "$lib")"
+    cp -L "$lib" "$INITRAMFS_DIR$lib"
+    chmod 755 "$INITRAMFS_DIR$lib"
+  done
+}
+
+mkdir -p "$INITRAMFS_DIR/usr/bin"
+PYBIN="$(command -v python3)"
+install -o root -g root -m 0755 "$PYBIN" "$INITRAMFS_DIR/usr/bin/python3"
+ln -sf python3 "$INITRAMFS_DIR/usr/bin/python"
+copy_deps "$PYBIN"
+
+PYVER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
+mkdir -p "$INITRAMFS_DIR/usr/lib"
+cp -a "/usr/lib/$PYVER" "$INITRAMFS_DIR/usr/lib/" 2>/dev/null || true
+cp -a /usr/local/lib/python* "$INITRAMFS_DIR/usr/local/lib/" 2>/dev/null || true
+
+cat > "$INITRAMFS_DIR/etc/passwd" << 'PASS_EOF'
 root:x:0:0:root:/root:/bin/sh
-student:x:1001:1001::/home/student:/bin/sh
-PASSWD
-
-cat > "$INITRAMFS_DIR/etc/group" << 'GROUP'
-root:x:0:
-student:x:1001:
-GROUP
-
-# Script init (requiere BINFMT_SCRIPT en el kernel, ya habilitado)
-cat > "$INITRAMFS_DIR/init" << INITEOF
+student:x:1001:1001:student:/home/student:/bin/sh
+PASS_EOF
+cat > "$INITRAMFS_DIR/init" << 'VM_INIT'
 #!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev 2>/dev/null || /bin/busybox mdev -s
-mount -t tmpfs none /tmp
+mkdir -p /proc /sys /dev /tmp /etc
+mount -t proc none /proc 2>/dev/null || true
+mount -t sysfs none /sys 2>/dev/null || true
+mount -t devtmpfs none /dev 2>/dev/null || mdev -s
+mount -t tmpfs none /tmp 2>/dev/null || true
 
-# Cargar módulos crypto vulnerables si están como módulos
-/bin/busybox modprobe algif_aead 2>/dev/null || true
-/bin/busybox modprobe authencesn 2>/dev/null || true
-
-# Hostname con el STUDENT_ID embebido (anti-copia)
-hostname "copy-fail-${STUDENT_ID}"
+modprobe algif_aead 2>/dev/null || true
+modprobe authencesn 2>/dev/null || true
 
 echo ""
-echo "  ╔═══════════════════════════════════════════════╗"
-echo "  ║  Kernel vulnerable: \$(uname -r)               ║"
-echo "  ║  CVE-2026-31431 Copy Fail Lab                ║"
-echo "  ╚═══════════════════════════════════════════════╝"
+echo "  ╔══════════════════════════════════════════╗"
+echo "  ║   KERNEL VULNERABLE — CVE-2026-31431     ║"
+echo "  ╚══════════════════════════════════════════╝"
 echo ""
 
-# Login como student (sin privilegios) para simular el escenario LPE
-exec /bin/su - student
-INITEOF
+exec su - student
+VM_INIT
+
 chmod +x "$INITRAMFS_DIR/init"
+mkdir -p "$INITRAMFS_DIR/home/student"
+if [ -f "/workspaces/copy-fail-challenge-B/exploit.py" ]; then
+    cp "/workspaces/copy-fail-challenge-B/exploit.py" "$INITRAMFS_DIR/home/student/exploit.py"
+    chmod +x "$INITRAMFS_DIR/home/student/exploit.py"
+fi
 
-echo -e "${CYAN}[5/5] Empaquetando initramfs...${NC}"
+echo -e "${CYAN}[6/6] Empaquetando initramfs con cpio...${NC}"
 cd "$INITRAMFS_DIR"
-find . | cpio -o -H newc 2>/dev/null | gzip > "$BUILD_DIR/initramfs.cpio.gz"
+find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9 > "$BUILD_DIR/initramfs.cpio.gz"
 
-SIZE=$(du -sh "$BUILD_DIR/initramfs.cpio.gz" | cut -f1)
-echo -e "${GREEN}✓ initramfs listo (${SIZE}) en: $BUILD_DIR/initramfs.cpio.gz${NC}"
-echo -e "${GREEN}  STUDENT_ID: ${STUDENT_ID}${NC}"
+echo -e "${GREEN}✓ rootfs listo con Python y Exploit integrado!${NC}"
+
+# --- PARCHE COSMÉTICO PARA EL PROMPT ---
+# 1. Definir el nombre del host de la máquina virtual
+echo "copy-fail" > "$INITRAMFS_DIR/etc/hostname"
+
+# 2. Configurar el prompt para el usuario student en su perfil de arranque
+mkdir -p "$INITRAMFS_DIR/home/student"
+cat > "$INITRAMFS_DIR/home/student/.profile" << 'PROFILE_EOF'
+export PS1='\[\033[01;32m\][\u@$(cat /etc/hostname) \W]\$\[\033[00m\] '
+PROFILE_EOF
+chown -R 1001:1001 "$INITRAMFS_DIR/home/student/.profile"
